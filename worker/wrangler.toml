@@ -1,0 +1,11 @@
+name = "collab-md"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "PAGES"
+class_name = "Page"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Page"]

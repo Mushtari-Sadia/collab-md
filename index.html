@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Collab Markdown</title>
+<style>
+  :root{--bg:#fff;--fg:#1d2024;--mut:#6b7280;--bd:#d8dce2;--ac:#2563eb;--warn:#b45309;--bad:#dc2626;--pn:#f6f7f9}
+  @media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e6e8eb;--mut:#9aa1ab;--bd:#2c3036;--ac:#6ea0ff;--warn:#f0a94a;--bad:#ff7b72;--pn:#1b1e23}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
+  header{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--bd)}
+  header h1{font-size:15px;margin:0 auto 0 0}
+  button,input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:4px 10px}
+  button{cursor:pointer} button.p{background:var(--ac);border-color:var(--ac);color:#fff}
+  input[type=number]{width:90px}
+  #status{color:var(--mut);font-size:13px}
+  #banner{display:none;padding:8px 16px;background:var(--pn);border-bottom:1px solid var(--bd);color:var(--warn);font-size:14px}
+  #banner button{margin-left:8px}
+  main{flex:1;display:grid;grid-template-columns:1fr 1fr;min-height:0}
+  @media (max-width:700px){main{grid-template-columns:1fr;grid-template-rows:1fr 1fr}}
+  textarea{border:0;border-right:1px solid var(--bd);border-radius:0;padding:16px;resize:none;outline:0;width:100%;height:100%;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,monospace}
+  #preview{padding:16px 20px;overflow:auto;background:var(--pn)}
+  #preview img{max-width:100%} #preview pre{overflow:auto;background:var(--bg);padding:10px;border-radius:6px}
+  #preview blockquote{margin-left:0;padding-left:12px;border-left:3px solid var(--bd);color:var(--mut)}
+  #count.warn{color:var(--warn)} #count.full{color:var(--bad);font-weight:600}
+  #home{max-width:440px;margin:15vh auto;padding:0 16px} #home h1{margin-top:0}
+  #home label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
+  .hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="home" class="hide">
+  <h1>Collab Markdown</h1>
+  <p>Create a page, share the link, and anyone with it can edit together. Markdown preview included.</p>
+  <label>Character limit</label>
+  <input id="newLimit" type="number" min="1" max="100000" value="2000">
+  <p><button id="create" class="p">Create page</button> <span id="homeErr" style="color:var(--bad)"></span></p>
+</div>
+
+<header id="bar" class="hide">
+  <h1>Collab Markdown</h1>
+  <span id="status"></span>
+  <span id="count">0 / 0</span>
+  <span id="limitBox" class="hide"><input id="limit" type="number" min="1" max="100000"> <button id="setLimit">Set limit</button></span>
+  <button id="copy">Copy link</button>
+  <button id="copyAdmin" class="hide">Copy admin link</button>
+</header>
+<div id="banner"></div>
+<main id="editor" class="hide">
+  <textarea id="ed" spellcheck="true" disabled></textarea>
+  <div id="preview"></div>
+</main>
+
+<script src="config.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const store = { get(k){try{return localStorage.getItem(k)||''}catch{return ''}}, set(k,v){try{localStorage.setItem(k,v)}catch{}} };
+const api = async (path, method='GET', body) => {
+  const r = await fetch(window.API_BASE + path, { method, headers:{'Content-Type':'application/json'}, body: body && JSON.stringify(body) });
+  return { status:r.status, ok:r.ok, data: await r.json().catch(() => ({})) };
+};
+const len = s => [...s].length;
+const status = t => $('status').textContent = t;
+
+let id = '', adminKey = '', limit = 0, version = 0, base = '', dirty = false, saving = false, timer = null;
+
+// ---- routing: #/p/<id>[?k=<adminKey>] ----
+function route(){
+  const m = location.hash.match(/^#\/p\/([\w-]{16})(?:\?k=([\w-]+))?$/);
+  if (!m) { $('home').classList.remove('hide'); return; }
+  id = m[1];
+  if (m[2]) { store.set('key:'+id, m[2]); history.replaceState(null, '', '#/p/'+id); }
+  adminKey = store.get('key:'+id);
+  openPage();
+}
+
+$('create').onclick = async () => {
+  const r = await api('/api/pages', 'POST', { limit: +$('newLimit').value });
+  if (!r.ok) return $('homeErr').textContent = r.data.error || 'Could not create page';
+  store.set('key:'+r.data.id, r.data.key);
+  location.hash = '#/p/' + r.data.id; location.reload();
+};
+
+// ---- merge: apply both sides' edits if they touch disjoint regions of base ----
+function merge(b, mine, theirs){
+  if (mine === b) return theirs;
+  if (theirs === b) return mine;
+  const [B, M, T] = [b, mine, theirs].map(s => Array.from(s));
+  const span = X => {
+    const n = Math.min(B.length, X.length); let p = 0, s = 0;
+    while (p < n && B[p] === X[p]) p++;
+    while (s < n - p && B[B.length-1-s] === X[X.length-1-s]) s++;
+    return { start:p, end:B.length - s, rep:X.slice(p, X.length - s) };
+  };
+  let a = span(M), c = span(T);
+  if (a.start > c.start) [a, c] = [c, a];
+  if (a.end >= c.start) return null; // overlapping (or touching) edits
+  return [...B.slice(0,a.start), ...a.rep, ...B.slice(a.end, c.start), ...c.rep, ...B.slice(c.end)].join('');
+}
+
+function render(){
+  const v = $('ed').value, n = len(v);
+  $('preview').innerHTML = DOMPurify.sanitize(marked.parse(v));
+  $('count').textContent = `${n} / ${limit}`;
+  $('count').className = n >= limit ? 'full' : n >= limit*0.9 ? 'warn' : '';
+}
+
+function setText(t){
+  const e = $('ed'), p = Math.min(e.selectionStart, t.length), q = Math.min(e.selectionEnd, t.length);
+  e.value = t; e.setSelectionRange(p, q); render();
+}
+
+function banner(html, theirs){
+  const b = $('banner'); b.style.display = html ? 'block' : 'none'; b.innerHTML = html;
+  if (!theirs) return;
+  $('theirs').onclick = () => { adopt(theirs); dirty = false; banner(''); };
+  $('mine').onclick = () => { version = theirs.version; banner(''); save(); };
+}
+function adopt(d){ version = d.version; base = d.text; limit = d.limit; setText(d.text); status('Updated'); }
+
+async function openPage(){
+  $('bar').classList.remove('hide'); $('editor').classList.remove('hide');
+  $('limitBox').classList.toggle('hide', !adminKey); $('copyAdmin').classList.toggle('hide', !adminKey);
+  const r = await api('/api/pages/'+id);
+  if (!r.ok) { $('bar').classList.add('hide'); $('editor').classList.add('hide'); $('home').classList.remove('hide'); $('homeErr').textContent = 'Page not found'; return; }
+  base = r.data.text; version = r.data.version; limit = r.data.limit;
+  $('ed').value = base; $('ed').disabled = false; $('limit').value = limit; render(); status('Ready');
+  setInterval(poll, 3000);
+}
+
+async function poll(){
+  if (saving || document.hidden) return;
+  const r = await api('/api/pages/'+id).catch(() => null);
+  if (!r?.ok) return;
+  if (r.data.limit !== limit) { limit = r.data.limit; $('limit').value = limit; render(); }
+  if (r.data.version !== version && !dirty) adopt(r.data);
+}
+
+async function save(){
+  if (saving || !dirty) return;
+  saving = true; status('Saving…');
+  const text = $('ed').value;
+  try {
+    const r = await api('/api/pages/'+id, 'PUT', { text, baseVersion: version });
+    if (r.ok) { version = r.data.version; base = text; dirty = $('ed').value !== text; status('Saved'); }
+    else if (r.status === 409) {
+      const merged = merge(base, $('ed').value, r.data.text);
+      if (merged !== null && len(merged) <= r.data.limit) {
+        version = r.data.version; base = r.data.text; limit = r.data.limit; setText(merged); status('Merged with remote edits');
+      } else banner(`Someone edited the same spot. <button id="theirs">Load theirs (discard mine)</button><button id="mine">Keep mine (overwrite)</button>`, r.data);
+    } else if (r.status === 413) { limit = r.data.limit; status('Over the limit'); }
+    else status('Save failed');
+  } catch { status('Offline, will retry'); }
+  saving = false;
+  if (dirty && $('banner').style.display !== 'block') schedule();
+}
+const schedule = () => { clearTimeout(timer); timer = setTimeout(save, 800); };
+
+$('ed').addEventListener('input', e => {
+  const t = e.target;
+  if (len(t.value) > limit) { const p = t.selectionStart; t.value = [...t.value].slice(0, limit).join(''); t.setSelectionRange(p, p); }
+  dirty = t.value !== base; render(); schedule(); if (dirty) status('Editing…');
+});
+
+$('setLimit').onclick = async () => {
+  const r = await api(`/api/pages/${id}/limit`, 'PUT', { limit: +$('limit').value, key: adminKey });
+  if (r.ok) { limit = r.data.limit; version = r.data.version; render(); status('Limit updated'); }
+  else status(r.data.error || 'Could not set limit');
+};
+const copy = (t, label) => navigator.clipboard.writeText(t).then(() => status(label + ' copied'));
+const pageUrl = () => location.href.split('#')[0] + '#/p/' + id;
+$('copy').onclick = () => copy(pageUrl(), 'Link');
+$('copyAdmin').onclick = () => copy(pageUrl() + '?k=' + adminKey, 'Admin link');
+addEventListener('beforeunload', e => { if (dirty) e.preventDefault(); });
+addEventListener('hashchange', () => location.reload());
+marked.setOptions({ gfm:true, breaks:true });
+route();
+</script>
+</body>
+</html>
